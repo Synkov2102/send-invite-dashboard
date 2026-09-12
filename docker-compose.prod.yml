@@ -1,0 +1,16 @@
+services:
+  backend:
+    image: ghcr.io/synkov2102/send-invite-dashboard-backend:main
+    restart: unless-stopped
+    env_file:
+      - .env.backend.production
+    ports:
+      - "127.0.0.1:8095:4000"
+
+  frontend:
+    image: ghcr.io/synkov2102/send-invite-dashboard-frontend:main
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "127.0.0.1:8094:80"

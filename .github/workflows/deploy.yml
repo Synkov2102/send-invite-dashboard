@@ -1,0 +1,142 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set image name
+        run: |
+          IMAGE_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (backend)
+        id: meta_backend
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Extract metadata (frontend)
+        id: meta_frontend
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ steps.meta_backend.outputs.tags }}
+          labels: ${{ steps.meta_backend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ steps.meta_frontend.outputs.tags }}
+          labels: ${{ steps.meta_frontend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    env:
+      SSH_KEY: ${{ secrets.VPS_SSH_KEY_B64 }}
+      SSH_HOST: ${{ secrets.VPS_SSH_HOST }}
+      SSH_USER: ${{ secrets.VPS_SSH_USER }}
+      DEPLOY_PATH: ${{ secrets.VPS_DASHBOARD_DEPLOY_PATH || '/opt/invite-dashboard' }}
+
+    steps:
+      - name: Checkout deployment configuration
+        uses: actions/checkout@v7
+
+      - name: Validate deployment secrets
+        run: |
+          test -n "$SSH_KEY" || (echo "VPS_SSH_KEY_B64 is not configured" && exit 1)
+          test -n "$SSH_HOST" || (echo "VPS_SSH_HOST is not configured" && exit 1)
+          test -n "$SSH_USER" || (echo "VPS_SSH_USER is not configured" && exit 1)
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" | base64 -d > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "${SSH_HOST}" >> ~/.ssh/known_hosts 2>/dev/null || true
+          printf '%s\n' 'Host *' '  ConnectTimeout 30' '  ServerAliveInterval 15' '  ServerAliveCountMax 3' >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      - name: Deploy
+        run: |
+          echo "Deploying send-invite-dashboard to production..."
+          SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o BatchMode=yes"
+
+          for i in 1 2 3; do
+            echo "Attempt $i/3..."
+            if ssh $SSH_OPTS "${SSH_USER}@${SSH_HOST}" "true"; then
+              break
+            fi
+            if [ "$i" -eq 3 ]; then
+              echo "SSH connection failed after 3 attempts"
+              exit 1
+            fi
+            sleep 10
+          done
+
+          echo "Uploading Compose configuration..."
+          ssh $SSH_OPTS "${SSH_USER}@${SSH_HOST}" "mkdir -p '$DEPLOY_PATH'"
+          scp $SSH_OPTS docker-compose.prod.yml "${SSH_USER}@${SSH_HOST}:$DEPLOY_PATH/docker-compose.prod.yml"
+
+          ssh $SSH_OPTS "${SSH_USER}@${SSH_HOST}" << EOF
+          set -e
+          cd "$DEPLOY_PATH"
+          echo "Pulling images and restarting stack..."
+          if docker compose version >/dev/null 2>&1; then
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+          else
+            docker-compose -f docker-compose.prod.yml pull
+            docker-compose -f docker-compose.prod.yml up -d --remove-orphans
+          fi
+          docker image prune -f
+          echo "Deployment completed"
+          EOF
