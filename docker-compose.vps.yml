@@ -1,6 +1,8 @@
 services:
   backend:
-    build: ./backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     restart: unless-stopped
     env_file:
       - backend/.env
@@ -10,7 +12,9 @@ services:
       - "127.0.0.1:8095:4000"
 
   frontend:
-    build: ./frontend
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
     restart: unless-stopped
     depends_on:
       - backend
