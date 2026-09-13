@@ -1,0 +1,21 @@
+services:
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    env_file:
+      - backend/.env
+    volumes:
+      - backend-data:/app/data
+    ports:
+      - "127.0.0.1:8095:4000"
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "127.0.0.1:8094:80"
+
+volumes:
+  backend-data:
